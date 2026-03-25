@@ -416,8 +416,8 @@ echo -e "${BOLD}================================================${NC}"
 echo ""
 echo -e "  已配置的转发规则:"
 for rule in "${RULES[@]}"; do
-    local range="${rule%%:*}"
-    local target="${rule##*:}"
+    range="${rule%%:*}"
+    target="${rule##*:}"
     echo -e "    UDP ${CYAN}${range}${NC} → ${GREEN}${target}${NC}"
 done
 echo ""
