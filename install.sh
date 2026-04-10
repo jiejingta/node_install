@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
 #
-# nft-port-hop — nftables UDP 端口跳跃转发一键配置
-# 适用于 Ubuntu 20.04 / 22.04 / 24.04 及 Debian 10+
-# 用法: bash <(curl -Ls https://raw.githubusercontent.com/<you>/nft-port-hop/main/install.sh)
+# HY2 节点一键部署脚本
+# 适用于 Ubuntu 20.04 / 22.04 / 24.04
 #
-
+# 功能：
+#   1. 安装官方 Hysteria2 并生成配置、启动服务
+#   2. 配置 nftables 端口跳跃转发
+#   3. 安装 fail2ban 防止 SSH 爆破
+#   4. 输出客户端连接配置
+#
 set -euo pipefail
 
-# ============================================================
-# 颜色与输出
-# ============================================================
+# ============ 固定配置 ============
+HY2_PORT=54000
+HY2_PASSWORD="RkMi0BPuVz"
+HY2_SNI="www.bing.com"
+HOP_START=50001
+HOP_END=53999
+# ==================================
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -17,415 +26,251 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-error() { echo -e "${RED}[ERROR]${NC} $*"; }
-ask()   { echo -en "${CYAN}[ASK]${NC}  $*"; }
+info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
-# ============================================================
-# 前置检查
-# ============================================================
-if [[ $EUID -ne 0 ]]; then
-    error "请以 root 身份运行此脚本"
-    exit 1
-fi
+# ============ 前置检查 ============
+[[ $EUID -ne 0 ]] && error "请以 root 身份运行"
 
-# 检查发行版
 if [[ -f /etc/os-release ]]; then
     . /etc/os-release
-    info "检测到系统: ${PRETTY_NAME:-$ID $VERSION_ID}"
+    info "系统: ${PRETTY_NAME}"
 else
-    warn "无法检测系统版本，继续执行……"
+    warn "无法检测系统版本，继续执行"
 fi
 
+SERVER_IP=$(curl -4 -s --max-time 5 ifconfig.me || curl -4 -s --max-time 5 ip.sb || echo "YOUR_SERVER_IP")
+
 # ============================================================
-# 安装 nftables（如果缺失）
+# 1. 安装 Hysteria2
 # ============================================================
-install_nftables() {
-    if command -v nft &>/dev/null; then
-        info "nftables 已安装: $(nft --version)"
-        return 0
+install_hysteria2() {
+    info "========== 安装 Hysteria2 =========="
+
+    # 如果已安装先清理
+    if command -v hysteria &>/dev/null; then
+        warn "检测到已有 Hysteria2，先卸载"
+        systemctl stop hysteria-server 2>/dev/null || true
+        systemctl disable hysteria-server 2>/dev/null || true
+        bash <(curl -fsSL https://get.hy2.sh/) --remove 2>/dev/null || true
+        rm -rf /etc/hysteria
+        userdel -r hysteria 2>/dev/null || true
+        rm -f /etc/systemd/system/multi-user.target.wants/hysteria-server.service
+        rm -f /etc/systemd/system/multi-user.target.wants/hysteria-server@*.service
+        systemctl daemon-reload
     fi
 
-    info "正在安装 nftables……"
-    apt-get install -y nftables >/dev/null 2>&1 || {
-        error "安装 nftables 失败，请手动执行: apt-get install -y nftables"
-        exit 1
-    }
-    info "nftables 安装完成: $(nft --version)"
-}
+    # 安装官方二进制
+    bash <(curl -fsSL https://get.hy2.sh/)
 
-install_nftables
+    # 生成自签证书
+    info "生成自签证书 (CN=${HY2_SNI})"
+    mkdir -p /etc/hysteria
+    openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+        -keyout /etc/hysteria/server.key -out /etc/hysteria/server.crt \
+        -subj "/CN=${HY2_SNI}" -days 3650 2>/dev/null
+    chmod 644 /etc/hysteria/server.key /etc/hysteria/server.crt
 
-# ============================================================
-# 网卡探测
-# ============================================================
-detect_interface() {
-    # 获取默认路由对应网卡
-    local default_iface
-    default_iface=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+    # 写入配置
+    info "写入配置文件"
+    cat > /etc/hysteria/config.yaml << EOF
+listen: :${HY2_PORT}
 
-    # 列出所有非 lo、非 docker/veth/br 的物理/虚拟网卡
-    local all_ifaces=()
-    while IFS= read -r line; do
-        all_ifaces+=("$line")
-    done < <(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -vE '^(lo|docker|br-|veth)')
+tls:
+  cert: /etc/hysteria/server.crt
+  key: /etc/hysteria/server.key
 
-    if [[ ${#all_ifaces[@]} -eq 0 ]]; then
-        error "未检测到可用网卡"
-        exit 1
-    fi
+auth:
+  type: password
+  password: ${HY2_PASSWORD}
 
-    echo ""
-    info "检测到以下网卡:"
-    echo ""
-    for i in "${!all_ifaces[@]}"; do
-        local iface="${all_ifaces[$i]}"
-        local addr
-        addr=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet / {print $2}' | head -1)
-        local marker=""
-        if [[ "$iface" == "$default_iface" ]]; then
-            marker=" ${GREEN}<— 默认路由${NC}"
-        fi
-        echo -e "  ${BOLD}$((i + 1)))${NC} ${iface}  ${addr:-无IPv4}${marker}"
-    done
-    echo ""
+masquerade:
+  type: proxy
+  proxy:
+    url: https://${HY2_SNI}
+    rewriteHost: true
+EOF
 
-    if [[ ${#all_ifaces[@]} -eq 1 ]]; then
-        IFACE="${all_ifaces[0]}"
-        info "仅有一张网卡，自动选择: ${BOLD}${IFACE}${NC}"
-        return 0
-    fi
+    # 启动
+    systemctl enable --now hysteria-server
+    sleep 1
 
-    # 如果有默认路由网卡，推荐它
-    if [[ -n "$default_iface" ]]; then
-        ask "请选择网卡 [回车默认 ${BOLD}${default_iface}${NC}]: "
-        read -r choice
-        if [[ -z "$choice" ]]; then
-            IFACE="$default_iface"
-            info "已选择: ${BOLD}${IFACE}${NC}"
-            return 0
-        fi
+    if systemctl is-active --quiet hysteria-server; then
+        info "Hysteria2 启动成功"
     else
-        ask "请选择网卡编号: "
-        read -r choice
-    fi
-
-    # 按编号选择
-    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#all_ifaces[@]} )); then
-        IFACE="${all_ifaces[$((choice - 1))]}"
-    else
-        # 按名称选择
-        local found=0
-        for iface in "${all_ifaces[@]}"; do
-            if [[ "$iface" == "$choice" ]]; then
-                IFACE="$iface"
-                found=1
-                break
-            fi
-        done
-        if [[ $found -eq 0 ]]; then
-            error "无效选择: $choice"
-            exit 1
-        fi
-    fi
-    info "已选择: ${BOLD}${IFACE}${NC}"
-}
-
-IFACE=""
-detect_interface
-
-# ============================================================
-# 规则收集
-# ============================================================
-declare -a RULES=()   # 每条规则格式: "start_port-end_port:target_port"
-
-validate_port() {
-    local port="$1"
-    if [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )); then
-        return 0
-    fi
-    return 1
-}
-
-# 检查端口范围是否与已有规则冲突
-check_conflict() {
-    local new_start="$1"
-    local new_end="$2"
-    local new_target="$3"
-
-    for rule in "${RULES[@]}"; do
-        local range="${rule%%:*}"
-        local existing_target="${rule##*:}"
-        local existing_start="${range%%-*}"
-        local existing_end="${range##*-}"
-
-        # 检查转发目标端口是否落在某条规则的源范围内
-        if (( new_target >= existing_start && new_target <= existing_end )); then
-            echo "转发目标端口 ${new_target} 落在已有规则 ${existing_start}-${existing_end} 的范围内"
-            return 1
-        fi
-
-        # 检查已有规则的目标端口是否落在新规则的源范围内
-        if (( existing_target >= new_start && existing_target <= new_end )); then
-            echo "已有规则的目标端口 ${existing_target} 落在新规则 ${new_start}-${new_end} 的范围内"
-            return 1
-        fi
-
-        # 检查源端口范围重叠
-        if (( new_start <= existing_end && new_end >= existing_start )); then
-            echo "端口范围 ${new_start}-${new_end} 与已有规则 ${existing_start}-${existing_end} 重叠"
-            return 1
-        fi
-
-        # 检查新的转发目标与已有转发目标相同（不同范围转给同一端口通常是ok的，但提示一下）
-    done
-
-    # 检查目标端口是否在自己的源范围内
-    if (( new_target >= new_start && new_target <= new_end )); then
-        echo "转发目标端口 ${new_target} 不能在源范围 ${new_start}-${new_end} 内"
-        return 1
-    fi
-
-    return 0
-}
-
-add_rule_interactive() {
-    local start_port end_port target_port
-
-    while true; do
-        echo ""
-        ask "请输入源端口范围起始 (如 50001): "
-        read -r start_port
-        if ! validate_port "$start_port"; then
-            error "无效端口: $start_port (需要 1-65535)"
-            continue
-        fi
-
-        ask "请输入源端口范围结束 (如 53999): "
-        read -r end_port
-        if ! validate_port "$end_port"; then
-            error "无效端口: $end_port (需要 1-65535)"
-            continue
-        fi
-
-        if (( start_port >= end_port )); then
-            error "起始端口必须小于结束端口"
-            continue
-        fi
-
-        ask "请输入转发目标端口 (如 54999): "
-        read -r target_port
-        if ! validate_port "$target_port"; then
-            error "无效端口: $target_port (需要 1-65535)"
-            continue
-        fi
-
-        local conflict
-        conflict=$(check_conflict "$start_port" "$end_port" "$target_port") || {
-            error "配置冲突: $conflict"
-            continue
-        }
-
-        RULES+=("${start_port}-${end_port}:${target_port}")
-        info "已添加规则: UDP ${start_port}-${end_port} → ${target_port}"
-        break
-    done
-}
-
-collect_rules() {
-    echo ""
-    echo -e "${BOLD}================================================${NC}"
-    echo -e "${BOLD}  配置端口跳跃转发规则${NC}"
-    echo -e "${BOLD}================================================${NC}"
-    echo ""
-    echo -e "  默认配置包含以下规则:"
-    echo ""
-    echo -e "  ${CYAN}1)${NC} UDP 50001-53999 → 54999  ${YELLOW}(Hysteria2)${NC}"
-    echo -e "  ${CYAN}2)${NC} UDP 40001-43999 → 44999  ${YELLOW}(Hysteria1)${NC}"
-    echo ""
-
-    ask "是否使用默认配置？[Y/n]: "
-    read -r use_default
-
-    if [[ -z "$use_default" || "$use_default" =~ ^[Yy]$ ]]; then
-        # 默认规则
-        RULES+=("50001-53999:54999")
-        RULES+=("40001-43999:44999")
-        info "已加载默认配置 (2 条规则)"
-    else
-        info "进入自定义配置模式"
-        add_rule_interactive
-
-        while true; do
-            echo ""
-            ask "是否继续添加规则？[y/N]: "
-            read -r more
-            if [[ "$more" =~ ^[Yy]$ ]]; then
-                add_rule_interactive
-            else
-                break
-            fi
-        done
-    fi
-
-    # 最终确认
-    echo ""
-    info "即将应用以下规则 (网卡: ${BOLD}${IFACE}${NC}):"
-    echo ""
-    for rule in "${RULES[@]}"; do
-        local range="${rule%%:*}"
-        local target="${rule##*:}"
-        echo -e "  ${GREEN}✓${NC} UDP ${range} → ${target}"
-    done
-    echo ""
-    ask "确认执行？[Y/n]: "
-    read -r confirm
-    if [[ "$confirm" =~ ^[Nn]$ ]]; then
-        info "已取消"
-        exit 0
+        error "Hysteria2 启动失败，请检查: journalctl -u hysteria-server --no-pager -n 20"
     fi
 }
 
-collect_rules
+# ============================================================
+# 2. 配置 nftables 端口跳跃
+# ============================================================
+setup_port_hopping() {
+    info "========== 配置端口跳跃 =========="
 
-# ============================================================
-# 清理旧配置（如果存在）
-# ============================================================
-cleanup_old() {
-    if nft list table ip hysteria_hop &>/dev/null 2>&1; then
-        warn "检测到已有 hysteria_hop 表，正在清理……"
-        nft delete table ip hysteria_hop
-        info "旧配置已清理"
+    # 安装 nftables
+    if ! command -v nft &>/dev/null; then
+        info "安装 nftables"
+        apt-get update -qq
+        apt-get install -y nftables >/dev/null 2>&1
     fi
-}
 
-cleanup_old
+    # 探测网卡
+    local iface
+    iface=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+    if [[ -z "$iface" ]]; then
+        iface=$(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -vE '^(lo|docker|br-|veth)' | head -1)
+    fi
+    [[ -z "$iface" ]] && error "未检测到可用网卡"
+    info "使用网卡: ${iface}"
 
-# ============================================================
-# 应用 nftables 规则
-# ============================================================
-apply_rules() {
-    info "正在创建 nftables 规则……"
+    # 清理旧规则
+    nft list table ip hysteria_hop &>/dev/null 2>&1 && nft delete table ip hysteria_hop
 
+    # 创建规则
     nft add table ip hysteria_hop
     nft add chain ip hysteria_hop prerouting '{ type nat hook prerouting priority dstnat; }'
+    nft add rule ip hysteria_hop prerouting iif "$iface" udp dport ${HOP_START}-${HOP_END} counter dnat to :${HY2_PORT}
+    info "已配置: UDP ${HOP_START}-${HOP_END} → ${HY2_PORT}"
 
-    for rule in "${RULES[@]}"; do
-        local range="${rule%%:*}"
-        local target="${rule##*:}"
-        local start="${range%%-*}"
-        local end="${range##*-}"
-
-        nft add rule ip hysteria_hop prerouting iif "$IFACE" udp dport "$start"-"$end" counter dnat to :"$target"
-        info "已应用: UDP ${start}-${end} → ${target}"
-    done
-}
-
-apply_rules
-
-# ============================================================
-# 持久化
-# ============================================================
-persist_rules() {
+    # 持久化
     local conf_dir="/etc/nftables.d"
-    local conf_file="${conf_dir}/hysteria-hop.conf"
-    local main_conf="/etc/nftables.conf"
-
     mkdir -p "$conf_dir"
+    cat > "${conf_dir}/hysteria-hop.conf" << EOF
+#!/usr/sbin/nft -f
+# 端口跳跃转发 — 自动生成于 $(date '+%Y-%m-%d %H:%M:%S')
+table ip hysteria_hop {
+    chain prerouting {
+        type nat hook prerouting priority dstnat;
+        iif ${iface} udp dport ${HOP_START}-${HOP_END} counter dnat to :${HY2_PORT}
+    }
+}
+EOF
 
-    info "正在写入持久化配置: ${conf_file}"
-
-    {
-        echo "#!/usr/sbin/nft -f"
-        echo ""
-        echo "# 端口跳跃转发规则 — 由 nft-port-hop 脚本生成"
-        echo "# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "# 网卡: ${IFACE}"
-        echo ""
-        echo "table ip hysteria_hop {"
-        echo "    chain prerouting {"
-        echo "        type nat hook prerouting priority dstnat;"
-        for rule in "${RULES[@]}"; do
-            local range="${rule%%:*}"
-            local target="${rule##*:}"
-            local start="${range%%-*}"
-            local end="${range##*-}"
-            echo "        iif ${IFACE} udp dport ${start}-${end} counter dnat to :${target}"
-        done
-        echo "    }"
-        echo "}"
-    } > "$conf_file"
-
-    chmod 644 "$conf_file"
-
-    # 确保 main conf 存在且包含 include
+    # 确保 nftables.conf 包含 include
+    local main_conf="/etc/nftables.conf"
     if [[ ! -f "$main_conf" ]]; then
-        {
-            echo "#!/usr/sbin/nft -f"
-            echo "flush ruleset"
-            echo "include \"${conf_dir}/*.conf\""
-        } > "$main_conf"
-    elif ! grep -q "${conf_dir}/\*\.conf" "$main_conf" 2>/dev/null; then
-        # 追加 include（避免重复）
-        echo "" >> "$main_conf"
-        echo "# nft-port-hop 自动添加" >> "$main_conf"
-        echo "include \"${conf_dir}/*.conf\"" >> "$main_conf"
+        cat > "$main_conf" << 'EOF2'
+#!/usr/sbin/nft -f
+flush ruleset
+include "/etc/nftables.d/*.conf"
+EOF2
+    elif ! grep -q '/etc/nftables.d/\*\.conf' "$main_conf" 2>/dev/null; then
+        echo '' >> "$main_conf"
+        echo 'include "/etc/nftables.d/*.conf"' >> "$main_conf"
     fi
 
-    # 处理 flush ruleset 与独立 table 的冲突
-    # 如果 main conf 里有 flush ruleset，我们的文件需要在 flush 之后加载
-    # include 在 flush 之后就能正常工作
-
-    # 启用 nftables 服务
     systemctl enable nftables >/dev/null 2>&1 || true
-    systemctl restart nftables >/dev/null 2>&1 || true
-
-    info "持久化完成，重启后规则自动生效"
+    info "端口跳跃配置完成并已持久化"
 }
 
-persist_rules
-
 # ============================================================
-# 验证
+# 3. 安装 fail2ban
 # ============================================================
-verify() {
-    echo ""
-    info "验证当前 nftables 规则:"
-    echo ""
-    nft list table ip hysteria_hop
-    echo ""
+setup_fail2ban() {
+    info "========== 安装 fail2ban =========="
 
-    # 快速检查 nftables 服务状态
-    if systemctl is-enabled nftables &>/dev/null; then
-        info "nftables 服务: ${GREEN}已启用 (开机自启)${NC}"
+    if command -v fail2ban-client &>/dev/null; then
+        info "fail2ban 已安装，跳过"
     else
-        warn "nftables 服务未设为开机自启，请手动执行: systemctl enable nftables"
+        apt-get update -qq
+        apt-get install -y fail2ban >/dev/null 2>&1
+    fi
+
+    # SSH 防爆破配置
+    cat > /etc/fail2ban/jail.local << 'EOF'
+[sshd]
+enabled  = true
+port     = ssh
+filter   = sshd
+logpath  = /var/log/auth.log
+maxretry = 5
+findtime = 600
+bantime  = 3600
+EOF
+
+    systemctl enable --now fail2ban
+    systemctl restart fail2ban
+    info "fail2ban 已启动，SSH 连续失败 5 次将封禁 1 小时"
+}
+
+# ============================================================
+# 4. 防火墙放行
+# ============================================================
+setup_firewall() {
+    info "========== 防火墙放行 =========="
+
+    if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
+        ufw allow ${HY2_PORT}/udp >/dev/null 2>&1
+        ufw allow ${HOP_START}:${HOP_END}/udp >/dev/null 2>&1
+        info "ufw 已放行 UDP ${HOP_START}-${HOP_END} 和 ${HY2_PORT}"
+    else
+        # 直接用 iptables 兜底
+        iptables -C INPUT -p udp --dport ${HY2_PORT} -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT -p udp --dport ${HY2_PORT} -j ACCEPT
+        iptables -C INPUT -p udp --dport ${HOP_START}:${HOP_END} -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT -p udp --dport ${HOP_START}:${HOP_END} -j ACCEPT
+        info "iptables 已放行 UDP ${HOP_START}-${HOP_END} 和 ${HY2_PORT}"
     fi
 }
 
-verify
+# ============================================================
+# 执行
+# ============================================================
+install_hysteria2
+setup_port_hopping
+setup_fail2ban
+setup_firewall
 
 # ============================================================
-# 提示
+# 5. 输出客户端配置
 # ============================================================
 echo ""
-echo -e "${BOLD}================================================${NC}"
-echo -e "${GREEN}${BOLD}  配置完成！${NC}"
-echo -e "${BOLD}================================================${NC}"
+echo -e "${BOLD}================================================================${NC}"
+echo -e "${GREEN}${BOLD}  部署完成！${NC}"
+echo -e "${BOLD}================================================================${NC}"
 echo ""
-echo -e "  已配置的转发规则:"
-for rule in "${RULES[@]}"; do
-    range="${rule%%:*}"
-    target="${rule##*:}"
-    echo -e "    UDP ${CYAN}${range}${NC} → ${GREEN}${target}${NC}"
-done
+echo -e "  ${BOLD}服务状态:${NC}"
+echo -e "    Hysteria2  $(systemctl is-active hysteria-server)"
+echo -e "    fail2ban   $(systemctl is-active fail2ban)"
+echo -e "    nftables   $(systemctl is-enabled nftables 2>/dev/null || echo 'unknown')"
 echo ""
-echo -e "  ${BOLD}常用命令:${NC}"
-echo -e "    查看规则    ${CYAN}nft list table ip hysteria_hop${NC}"
-echo -e "    查看计数    ${CYAN}nft list ruleset | grep counter${NC}"
-echo -e "    删除所有    ${CYAN}nft delete table ip hysteria_hop${NC}"
-echo -e "    配置文件    ${CYAN}/etc/nftables.d/hysteria-hop.conf${NC}"
+echo -e "  ${BOLD}端口跳跃:${NC}"
+echo -e "    UDP ${CYAN}${HOP_START}-${HOP_END}${NC} → ${GREEN}${HY2_PORT}${NC}"
 echo ""
-echo -e "  ${YELLOW}提醒:${NC} 如果是云服务器，请确保安全组/防火墙已放行对应 UDP 端口范围"
+echo -e "${BOLD}================================================================${NC}"
+echo -e "${BOLD}  sing-box 客户端 outbound 配置${NC}"
+echo -e "${BOLD}================================================================${NC}"
+cat << EOF
+
+{
+  "type": "hysteria2",
+  "tag": "hy2-${SERVER_IP##*.}",
+  "server": "${SERVER_IP}",
+  "server_ports": [
+    "${HOP_START}:${HOP_END}"
+  ],
+  "hop_interval": "30s",
+  "up_mbps": 20,
+  "down_mbps": 20,
+  "password": "${HY2_PASSWORD}",
+  "tls": {
+    "enabled": true,
+    "server_name": "${HY2_SNI}",
+    "insecure": true,
+    "alpn": ["h3"]
+  }
+}
+
+EOF
+echo -e "${BOLD}================================================================${NC}"
+echo -e "${BOLD}  通用 Hysteria2 URI（可导入各类客户端）${NC}"
+echo -e "${BOLD}================================================================${NC}"
+echo ""
+echo -e "  ${CYAN}hy2://${HY2_PASSWORD}@${SERVER_IP}:${HOP_START}?insecure=1&sni=${HY2_SNI}&mport=${HOP_START}-${HOP_END}#hy2-${SERVER_IP##*.}${NC}"
+echo ""
+echo -e "${BOLD}================================================================${NC}"
+echo ""
+echo -e "  ${YELLOW}提醒:${NC} 如果是云服务器，请确保安全组已放行 UDP ${HOP_START}-${HOP_END}"
 echo ""
