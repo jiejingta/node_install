@@ -175,8 +175,15 @@ setup_fail2ban() {
     if command -v fail2ban-client &>/dev/null; then
         info "fail2ban 已安装，跳过"
     else
-        apt-get update -qq
-        apt-get install -y fail2ban >/dev/null 2>&1
+        info "安装 fail2ban（若失败将跳过，不中断后续部署）"
+        if ! DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
+            warn "apt-get update 失败，跳过 fail2ban 安装"
+            return 0
+        fi
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban; then
+            warn "fail2ban 安装失败，跳过该步骤"
+            return 0
+        fi
     fi
 
     # SSH 防爆破配置
@@ -191,9 +198,11 @@ findtime = 600
 bantime  = 3600
 EOF
 
-    systemctl enable --now fail2ban
-    systemctl restart fail2ban
-    info "fail2ban 已启动，SSH 连续失败 5 次将封禁 1 小时"
+    if systemctl enable --now fail2ban && systemctl restart fail2ban; then
+        info "fail2ban 已启动，SSH 连续失败 5 次将封禁 1 小时"
+    else
+        warn "fail2ban 服务启动失败，请手动检查: journalctl -u fail2ban --no-pager -n 20"
+    fi
 }
 
 # ============================================================
