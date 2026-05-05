@@ -8,7 +8,7 @@
 bash <(curl -Ls https://raw.githubusercontent.com/jiejingta/node_install/main/hy2-node-setup.sh)
 ```
 
-需要 root 权限，适用于 Ubuntu 20.04 / 22.04 / 24.04。
+需要 root 权限，适用于 Ubuntu 20.04 / 22.04 / 24.04 及对应 Debian 系统。
 
 ## 脚本做了什么
 
@@ -18,6 +18,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/jiejingta/node_install/main/hy
 | 端口跳跃 | 安装 nftables，配置 UDP 50001-53999 转发到 54000，持久化重启不丢失 |
 | fail2ban | 安装并配置 SSH 防爆破，连续失败 5 次封禁 1 小时 |
 | 防火墙放行 | 自动放行 UDP 端口范围（ufw 或 iptables） |
+| 默认开启 BBR | 写入并应用 BBR 相关 sysctl 参数 |
+| UDP Ping 探测 | 启动 `screen` + `socat` 的 `udpping` 会话，监听 `5000/UDP`，执行 `cat` 回显 |
 | 输出配置 | 安装完成后打印 sing-box outbound 配置和通用 hy2:// URI |
 
 ## 默认参数
@@ -28,6 +30,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/jiejingta/node_install/main/hy
 | 端口跳跃范围 | 50001-53999 |
 | 密码 | RkMi0BPuVz |
 | TLS SNI | www.bing.com |
+| UDP Ping 端口 | 5000/UDP |
 | 证书 | 自签，有效期 10 年 |
 
 如需修改，编辑脚本顶部的配置区域即可。
@@ -78,6 +81,10 @@ nft list ruleset | grep counter       # 查看转发计数
 # fail2ban
 fail2ban-client status sshd           # 查看 SSH 封禁状态
 fail2ban-client unban <IP>            # 手动解封
+
+# UDP Ping 探测
+screen -list | grep udpping           # 查看 udpping 会话
+screen -S udpping -X quit             # 停止 UDP Ping 服务
 ```
 
 ## 卸载
