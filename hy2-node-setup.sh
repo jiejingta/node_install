@@ -43,6 +43,23 @@ fi
 
 SERVER_IP=$(curl -4 -s --max-time 5 ifconfig.me || curl -4 -s --max-time 5 ip.sb || echo "YOUR_SERVER_IP")
 
+wait_for_apt_lock() {
+    local timeout="${1:-300}"
+    local waited=0
+
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+       || fuser /var/lib/dpkg/lock >/dev/null 2>&1 \
+       || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+        if (( waited >= timeout )); then
+            return 1
+        fi
+        sleep 3
+        waited=$((waited + 3))
+    done
+
+    return 0
+}
+
 # ============================================================
 # 1. 安装 Hysteria2
 # ============================================================
@@ -176,8 +193,16 @@ setup_fail2ban() {
         info "fail2ban 已安装，跳过"
     else
         info "安装 fail2ban（若失败将跳过，不中断后续部署）"
+        if ! wait_for_apt_lock 300; then
+            warn "apt/dpkg 锁长期被占用，跳过 fail2ban 安装"
+            return 0
+        fi
         if ! DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
             warn "apt-get update 失败，跳过 fail2ban 安装"
+            return 0
+        fi
+        if ! wait_for_apt_lock 300; then
+            warn "apt/dpkg 锁长期被占用，跳过 fail2ban 安装"
             return 0
         fi
         if ! DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban; then
