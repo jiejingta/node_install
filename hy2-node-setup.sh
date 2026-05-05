@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #
 # HY2 节点一键部署脚本
-# 适用于 Ubuntu 20.04 / 22.04 / 24.04
+# 适用于 Ubuntu 20.04 / 22.04 / 24.04 与对应 Debian 系统
 #
 # 功能：
 #   1. 安装官方 Hysteria2 并生成配置、启动服务
 #   2. 配置 nftables 端口跳跃转发
 #   3. 安装 fail2ban 防止 SSH 爆破
-#   4. 输出客户端连接配置
+#   4. 默认开启 BBR 拥塞控制
+#   5. 输出客户端连接配置
 #
 set -euo pipefail
 
@@ -215,6 +216,35 @@ setup_firewall() {
     fi
 }
 
+
+# ============================================================
+# 5. 开启 BBR
+# ============================================================
+setup_bbr() {
+    info "========== 开启 BBR =========="
+
+    if ! grep -q '^net.core.default_qdisc=fq$' /etc/sysctl.conf 2>/dev/null; then
+        echo 'net.core.default_qdisc=fq' >> /etc/sysctl.conf
+    fi
+
+    if ! grep -q '^net.ipv4.tcp_congestion_control=bbr$' /etc/sysctl.conf 2>/dev/null; then
+        echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.conf
+    fi
+
+    modprobe tcp_bbr 2>/dev/null || true
+    sysctl -p >/dev/null 2>&1 || true
+
+    local qdisc cc
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
+
+    if [[ "$cc" == "bbr" ]]; then
+        info "BBR 已开启 (qdisc=${qdisc}, congestion_control=${cc})"
+    else
+        warn "BBR 设置未生效，当前 congestion_control=${cc}"
+    fi
+}
+
 # ============================================================
 # 执行
 # ============================================================
@@ -222,9 +252,10 @@ install_hysteria2
 setup_port_hopping
 setup_fail2ban
 setup_firewall
+setup_bbr
 
 # ============================================================
-# 5. 输出客户端配置
+# 6. 输出客户端配置
 # ============================================================
 echo ""
 echo -e "${BOLD}================================================================${NC}"
