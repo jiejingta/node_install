@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #
 # HY2 节点一键部署脚本
-# 适用于 Ubuntu 20.04 / 22.04 / 24.04
+# 适用于 Ubuntu 20.04 / 22.04 / 24.04 与对应 Debian 系统
 #
 # 功能：
 #   1. 安装官方 Hysteria2 并生成配置、启动服务
 #   2. 配置 nftables 端口跳跃转发
 #   3. 安装 fail2ban 防止 SSH 爆破
-#   4. 输出客户端连接配置
+#   4. 默认开启 BBR 拥塞控制
+#   5. 输出客户端连接配置
 #
 set -euo pipefail
 
@@ -174,8 +175,15 @@ setup_fail2ban() {
     if command -v fail2ban-client &>/dev/null; then
         info "fail2ban 已安装，跳过"
     else
-        apt-get update -qq
-        apt-get install -y fail2ban >/dev/null 2>&1
+        info "安装 fail2ban（若失败将跳过，不中断后续部署）"
+        if ! DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
+            warn "apt-get update 失败，跳过 fail2ban 安装"
+            return 0
+        fi
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban; then
+            warn "fail2ban 安装失败，跳过该步骤"
+            return 0
+        fi
     fi
 
     # SSH 防爆破配置
@@ -190,9 +198,11 @@ findtime = 600
 bantime  = 3600
 EOF
 
-    systemctl enable --now fail2ban
-    systemctl restart fail2ban
-    info "fail2ban 已启动，SSH 连续失败 5 次将封禁 1 小时"
+    if systemctl enable --now fail2ban && systemctl restart fail2ban; then
+        info "fail2ban 已启动，SSH 连续失败 5 次将封禁 1 小时"
+    else
+        warn "fail2ban 服务启动失败，请手动检查: journalctl -u fail2ban --no-pager -n 20"
+    fi
 }
 
 # ============================================================
@@ -215,6 +225,35 @@ setup_firewall() {
     fi
 }
 
+
+# ============================================================
+# 5. 开启 BBR
+# ============================================================
+setup_bbr() {
+    info "========== 开启 BBR =========="
+
+    if ! grep -q '^net.core.default_qdisc=fq$' /etc/sysctl.conf 2>/dev/null; then
+        echo 'net.core.default_qdisc=fq' >> /etc/sysctl.conf
+    fi
+
+    if ! grep -q '^net.ipv4.tcp_congestion_control=bbr$' /etc/sysctl.conf 2>/dev/null; then
+        echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.conf
+    fi
+
+    modprobe tcp_bbr 2>/dev/null || true
+    sysctl -p >/dev/null 2>&1 || true
+
+    local qdisc cc
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
+
+    if [[ "$cc" == "bbr" ]]; then
+        info "BBR 已开启 (qdisc=${qdisc}, congestion_control=${cc})"
+    else
+        warn "BBR 设置未生效，当前 congestion_control=${cc}"
+    fi
+}
+
 # ============================================================
 # 执行
 # ============================================================
@@ -222,9 +261,10 @@ install_hysteria2
 setup_port_hopping
 setup_fail2ban
 setup_firewall
+setup_bbr
 
 # ============================================================
-# 5. 输出客户端配置
+# 6. 输出客户端配置
 # ============================================================
 echo ""
 echo -e "${BOLD}================================================================${NC}"
