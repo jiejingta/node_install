@@ -8,7 +8,8 @@
 #   2. 配置 nftables 端口跳跃转发
 #   3. 安装 fail2ban 防止 SSH 爆破
 #   4. 默认开启 BBR 拥塞控制
-#   5. 输出客户端连接配置
+#   5. 启动 UDP Ping 探测服务（5000/UDP）
+#   6. 输出客户端连接配置
 #
 set -euo pipefail
 
@@ -280,6 +281,33 @@ setup_bbr() {
 }
 
 # ============================================================
+# 5. 启动 UDP Ping 探测服务
+# ============================================================
+setup_udp_ping() {
+    info "========== 启动 UDP Ping 探测服务 =========="
+
+    if ! command -v screen &>/dev/null || ! command -v socat &>/dev/null; then
+        info "安装 screen / socat"
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y screen socat >/dev/null 2>&1 || true
+    fi
+
+    if ! command -v screen &>/dev/null || ! command -v socat &>/dev/null; then
+        warn "screen 或 socat 未安装成功，跳过 UDP Ping 服务"
+        return 0
+    fi
+
+    screen -S udpping -X quit >/dev/null 2>&1 || true
+    screen -S udpping -dm socat UDP4-LISTEN:5000,fork EXEC:'cat'
+
+    if screen -list | grep -q "udpping"; then
+        info "UDP Ping 服务已启动: 5000/UDP (screen: udpping)"
+    else
+        warn "UDP Ping 服务启动失败"
+    fi
+}
+
+# ============================================================
 # 执行
 # ============================================================
 install_hysteria2
@@ -287,9 +315,10 @@ setup_port_hopping
 setup_fail2ban
 setup_firewall
 setup_bbr
+setup_udp_ping
 
 # ============================================================
-# 6. 输出客户端配置
+# 7. 输出客户端配置
 # ============================================================
 echo ""
 echo -e "${BOLD}================================================================${NC}"
